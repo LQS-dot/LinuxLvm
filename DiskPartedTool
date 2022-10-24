@@ -1,0 +1,23 @@
+#!/usr/bin/expect
+
+set disk   [lindex $argv 0]
+
+spawn bash
+send "/sbin/parted $disk\r"
+
+send "mklabel gpt\r"
+ 
+expect {
+    "Yes/No?" {send "yes\r"}
+   }
+
+expect {
+   "(parted)" {send "mkpart primary 1 100%\r"}
+}
+
+expect {
+    "(parted)" {send "quit\r"}
+   }
+
+exec sleep 1
+expect eof

@@ -1,0 +1,182 @@
+#!/bin/bash
+
+devname="/dev/sd* /dev/vd* /dev/hd*"
+disk_str=""
+
+function getmdsk
+{
+  for i in $devname
+  do
+    if ls $i > /dev/null 2>&1
+    then
+      if ! echo $i |grep -E "[0-9]" > /dev/null 2>&1
+      then
+          tmp_disk=`echo $i | awk -F'/' '{print $NF}'`
+          if ! grep "$tmp_disk" /usr/lib/tj-app-pkgdir/disk_list.txt > /dev/null 2>&1
+          then
+              disk_str=$disk_str" $i"
+          fi
+      fi
+    fi
+  done
+}
+
+getmdsk
+sdb=`echo $disk_str | awk -F' ' '{print $1}'`
+sdc=`echo $disk_str | awk -F' ' '{print $2}'`
+
+function clearpv ()
+{
+  # 删除物理卷
+  pvs=`pvdisplay $1|grep "PV Name"|awk '{print $3}'`
+  if [ "$pvs" != "" ]
+  then
+    for i in $pvs
+    do
+      logger -t "App Data partition" "Clear PV on $pvs"
+      pvremove -ff -y $pvs
+    done
+  fi
+}
+
+function dskparted ()
+{
+  # 使用parted创建新分区
+  disk_size=`fdisk -l | grep -E "Disk\s+$1" | awk '{print $5}'`
+  disk_size=`echo "scale=0;$disk_size/1000/1000/1000"|bc`
+
+  parts=`/sbin/parted -s "$1" print|sed -ne '/^Number/,$p'|grep -v ^Number|awk '{print $1}'|grep "^[0-9]"`
+  if [ "$parts" != "" ]&&[[ ! "$1" =~ "/dev/md" ]]||[[ $disk_size -lt 500 ]]
+  then
+    logger -t "App Data partition" "Exist data or Disk less than 500G"
+    exit 0
+  fi
+  /opt/smc/hardware/sbin/disk-parted-tool $1
+  logger -t "App Data partition" "Create part on $1"
+}
+
+function mklogical ()
+{
+  lvcreate -l"$Free_PE" -n "$1" VolGroup
+  mkfs -t ext4 /dev/mapper/VolGroup-"$1"
+  /bin/mount /dev/mapper/VolGroup-"$1" /data
+  $(sed -i "/^\/dev\/mapper\/VolGroup-$1/d" /etc/fstab)
+  echo "/dev/mapper/VolGroup-"$1" /data                   ext4     defaults        1 2" >> /etc/fstab
+}
+
+function MountData ()
+{
+  partprobe
+  pvcreate $1
+  vgextend VolGroup $1
+  Free_PE=`vgdisplay  | grep "Free  PE / Size" | awk '{print $(NF-3)}'`
+  if [ -d /data ];then rm -rf /data;fi
+  mkdir /data
+  if fdisk -l | grep "/dev/md0" > /dev/null 2>&1
+  then
+      # 存在raid1块，创建raid1逻辑卷
+      mklogical lv_raid1_data
+  else
+      mklogical lv_origdata
+  fi
+}
+
+function MoveData ()
+{
+  # move /opt/data -> /data
+  rm -rf /data/*
+  cp -rf /opt/data/* /data/
+  rm -rf /opt/data
+  ln -s /data /opt/
+  /etc/init.d/elasticsearch restart
+}
+
+
+function mkraid ()
+{
+  for premd in `mdadm -Ds|awk '{print $2}'`
+  do
+    # 禁止raid活动，释放资源
+    mdadm --stop $premd
+  done
+  # 创建raid，组新的阵列
+  yes|mdadm --quiet --create $1 --force --level=mirror --raid-devices=2 "$sdb"1 "$sdc"1 --metadata=1.2
+  if grep "/dev/md0" /etc/mdadm.conf > /dev/null 2>&1
+  then
+      sed -r -i "1s/(.*)/\1 "$sdb"1 "$sdc"1/g" /etc/mdadm.conf
+  else
+      echo DEVICE "$sdb"1 "$sdc"1 > /etc/mdadm.conf
+  fi
+  mdadm --detail --scan >> /etc/mdadm.conf
+  logger -t "App Data partition" "Create RAID1 done."
+}
+
+
+if [ ! -f /opt/smc/hardware/sbin/dataDiskInit ]
+then
+  if [ "$sdb" != "" ] && [ "$sdc" != "" ]
+  then
+      # 单机械盘初始化，不执行raid1操作
+      if df -h | grep "VolGroup-lv_origdata" > /dev/null 2>&1
+      then
+          logger -t "App Data partition" "Data partition was Existent"
+      else
+	  # 已经存在raid1,新盘组raid1,扩容至raid1所在逻辑卷组
+          if df -h | grep -E "VolGroup-lv_raid1_data" > /dev/null 2>&1
+          then
+	      ### 再次raid1加入卷组
+              raid1_disk=`cat /etc/mdadm.conf | grep "UUID" | tail -1 | awk '{print $2}'`
+              raid1_number=`echo $raid1_disk | tr -cd "0-9"`
+              new_number=`echo $((raid1_number+1))`
+              disk_name=`echo ${raid1_disk/$raid1_number/$new_number}`
+              dskparted $sdb
+              dskparted $sdc
+              mkraid $disk_name
+              # 磁盘格式化
+              mkfs.xfs -f $disk_name
+              # raid1区块创建分区
+              dskparted $disk_name
+              # 写入扩容文件
+              echo $disk_name"p1" >> /usr/lib/tj-app-pkgdir/disk_list.txt
+          else
+              # 首次初始化磁盘,创建raid1并且创建逻辑卷组
+              logger -t "App Data partition" "Creating data partition..."
+              # 删除物理卷、创建新分区、创建raid1，组新阵列
+              disk_name="/dev/md0"
+              dskparted $sdb
+              dskparted $sdc
+              mkraid $disk_name
+              # 磁盘格式化
+              mkfs.xfs -f $disk_name			  
+              # raid1区块创建分区
+              dskparted $disk_name
+              # raid1区块 --> 逻辑卷 --> 卷组
+              MountData $disk_name"p1"
+              MoveData
+	  fi
+          # 写入磁盘管理文件
+          sdb=`echo $sdb | awk -F'/' '{print $NF}'` 
+          sdc=`echo $sdc | awk -F'/' '{print $NF}'` 
+          echo "$sdb" >> /usr/lib/tj-app-pkgdir/disk_list.txt
+          echo "$sdc" >> /usr/lib/tj-app-pkgdir/disk_list.txt
+      fi
+  elif [ "$sdb" != "" ] && [ "$sdc" = "" ]
+  then
+      logger -t "App Data partition" "One disk only."
+      if df -h | grep -E " /data$" > /dev/null 2>&1
+      then    
+          logger -t "App Data partition" "Data partition was Existent"
+      else
+          logger -t "App Data partition" "Creating data partition..."
+          dskparted $sdb
+          SDB="$sdb"1
+          MountData $SDB
+          MoveData
+          # 写入磁盘管理文件
+          sdb=`echo $sdb | awk -F'/' '{print $NF}'` 
+          echo "$sdb" >> /usr/lib/tj-app-pkgdir/disk_list.txt
+      fi
+  else
+      logger -t "App Data partition" "Nothing to do."
+  fi
+fi

@@ -39,3 +39,4 @@
   Code: DiskPartedTool
     nothing to say
   ```
+  init
